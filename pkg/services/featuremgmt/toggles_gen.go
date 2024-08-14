@@ -371,6 +371,10 @@ const (
 	// Enable format string transformer
 	FlagFormatString = "formatString"
 
+	// FlagKubernetesPlaylists
+	// Use the kubernetes API in the frontend for playlists, and route /api/playlist requests to k8s
+	FlagKubernetesPlaylists = "kubernetesPlaylists"
+
 	// FlagTransformationsVariableSupport
 	// Allows using variables in transformations
 	FlagTransformationsVariableSupport = "transformationsVariableSupport"
