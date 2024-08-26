@@ -244,9 +244,9 @@ func TestIntegrationConfig(t *testing.T) {
 
 			for field := range config.Fields {
 				_, isSecret := allSecrets[field]
-				assert.Equal(t, isSecret, config.IsSecureField(field))
+				assert.Equal(t, isSecret, config.IsSecureField([]string{field}))
 			}
-			assert.False(t, config.IsSecureField("__--**unknown_field**--__"))
+			assert.False(t, config.IsSecureField([]string{"__--**unknown_field**--__"}))
 		})
 	}
 
@@ -264,7 +264,7 @@ func TestIntegration_SecureFields(t *testing.T) {
 				validIntegration := IntegrationGen(IntegrationMuts.WithValidConfig(integrationType))()
 				expected := make(map[string]bool, len(validIntegration.SecureSettings))
 				for field := range validIntegration.Config.Fields {
-					if validIntegration.Config.IsSecureField(field) {
+					if validIntegration.Config.IsSecureField([]string{field}) {
 						expected[field] = true
 						validIntegration.SecureSettings[field] = "test"
 						delete(validIntegration.Settings, field)
@@ -277,7 +277,7 @@ func TestIntegration_SecureFields(t *testing.T) {
 				validIntegration := IntegrationGen(IntegrationMuts.WithValidConfig(integrationType))()
 				expected := make(map[string]bool, len(validIntegration.SecureSettings))
 				for field := range validIntegration.Config.Fields {
-					if validIntegration.Config.IsSecureField(field) {
+					if validIntegration.Config.IsSecureField([]string{field}) {
 						expected[field] = true
 						validIntegration.Settings[field] = "test"
 						delete(validIntegration.SecureSettings, field)

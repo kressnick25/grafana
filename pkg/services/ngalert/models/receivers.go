@@ -10,6 +10,7 @@ import (
 	"maps"
 	"math"
 	"sort"
+	"strings"
 	"unsafe"
 
 	alertingNotify "github.com/grafana/alerting/notify"
@@ -148,7 +149,29 @@ type IntegrationConfig struct {
 // IntegrationField represents a field in an integration configuration.
 type IntegrationField struct {
 	Name   string
+	Fields map[string]IntegrationField
 	Secure bool
+}
+
+type IntegrationFieldPath []string
+
+func (f IntegrationFieldPath) Head() string {
+	if len(f) > 0 {
+		return f[0]
+	}
+	return ""
+}
+
+func (f IntegrationFieldPath) Tail() []string {
+	return f[1:]
+}
+
+func (f IntegrationFieldPath) IsLeaf() bool {
+	return len(f) == 1
+}
+
+func (f IntegrationFieldPath) String() string {
+	return strings.Join(f, ".")
 }
 
 // IntegrationConfigFromType returns an integration configuration for a given integration type. If the integration type is
@@ -160,23 +183,60 @@ func IntegrationConfigFromType(integrationType string) (IntegrationConfig, error
 	}
 
 	integrationConfig := IntegrationConfig{Type: config.Type, Fields: make(map[string]IntegrationField, len(config.Options))}
+
 	for _, option := range config.Options {
-		integrationConfig.Fields[option.PropertyName] = IntegrationField{
-			Name:   option.PropertyName,
-			Secure: option.Secure,
-		}
+		integrationConfig.Fields[option.PropertyName] = notifierOptionToIntegrationField(option)
 	}
 	return integrationConfig, nil
 }
 
+func notifierOptionToIntegrationField(option channels_config.NotifierOption) IntegrationField {
+	f := IntegrationField{
+		Name:   option.PropertyName,
+		Secure: option.Secure,
+		Fields: make(map[string]IntegrationField, len(option.SubformOptions)),
+	}
+	for _, subformOption := range option.SubformOptions {
+		f.Fields[subformOption.PropertyName] = notifierOptionToIntegrationField(subformOption)
+	}
+	return f
+}
+
 // IsSecureField returns true if the field is both known and marked as secure in the integration configuration.
-func (config *IntegrationConfig) IsSecureField(field string) bool {
-	if config.Fields != nil {
-		if f, ok := config.Fields[field]; ok {
-			return f.Secure
+func (config *IntegrationConfig) IsSecureField(path IntegrationFieldPath) bool {
+	f := config.GetField(path)
+	if f == nil {
+		return false
+	}
+	return f.Secure
+}
+
+func (config *IntegrationConfig) GetField(path IntegrationFieldPath) *IntegrationField {
+	for _, integrationField := range config.Fields {
+		if strings.EqualFold(integrationField.Name, path[0]) {
+			return integrationField.GetField(path[1:]...)
 		}
 	}
-	return false
+	return nil
+}
+
+func (config *IntegrationConfig) GetSecretFields() []IntegrationFieldPath {
+	return traverseFields(config.Fields, nil, func(i IntegrationField) bool {
+		return i.Secure
+	})
+}
+
+func traverseFields(flds map[string]IntegrationField, parentPath []string, predicate func(i IntegrationField) bool) []IntegrationFieldPath {
+	var result []IntegrationFieldPath
+	for key, field := range flds {
+		if predicate(field) {
+			result = append(result, append(parentPath, key))
+		}
+		if len(field.Fields) > 0 {
+			result = append(result, traverseFields(field.Fields, append(parentPath, key), predicate)...)
+		}
+	}
+	return result
 }
 
 func (config *IntegrationConfig) Clone() IntegrationConfig {
@@ -191,6 +251,15 @@ func (config *IntegrationConfig) Clone() IntegrationConfig {
 		}
 	}
 	return clone
+}
+
+func (field *IntegrationField) GetField(path ...string) *IntegrationField {
+	for _, integrationField := range field.Fields {
+		if strings.EqualFold(integrationField.Name, path[0]) {
+			return integrationField.GetField(path[1:]...)
+		}
+	}
+	return nil
 }
 
 func (field *IntegrationField) Clone() IntegrationField {
@@ -215,31 +284,87 @@ func (integration *Integration) Clone() Integration {
 // are stored in SecureSettings and the original values are removed from Settings.
 // If a field is already in SecureSettings it is not encrypted again.
 func (integration *Integration) Encrypt(encryptFn EncryptFn) error {
+	secretFieldPaths := integration.Config.GetSecretFields()
+	if len(secretFieldPaths) == 0 {
+		return nil
+	}
 	var errs []error
-	for key, val := range integration.Settings {
-		if isSecureField := integration.Config.IsSecureField(key); !isSecureField {
+	for _, path := range secretFieldPaths {
+		unencryptedSecureValue, ok, err := extractField(integration.Settings, path)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to extract secret field by path '%s': %w", path, err))
+		}
+		if !ok {
 			continue
 		}
-
-		delete(integration.Settings, key)
-		unencryptedSecureValue, isString := val.(string)
-		if !isString {
+		if _, exists := integration.SecureSettings[path.String()]; exists {
 			continue
 		}
-
-		if _, exists := integration.SecureSettings[key]; exists {
-			continue
-		}
-
 		encrypted, err := encryptFn(unencryptedSecureValue)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("failed to encrypt secure setting '%s': %w", key, err))
+			errs = append(errs, fmt.Errorf("failed to encrypt secure setting '%s': %w", path.String(), err))
 		}
-
-		integration.SecureSettings[key] = encrypted
+		integration.SecureSettings[path.String()] = encrypted
 	}
-
 	return errors.Join(errs...)
+}
+
+func extractField(settings map[string]any, path IntegrationFieldPath) (string, bool, error) {
+	val, ok := settings[path.Head()]
+	if !ok {
+		return "", false, nil
+	}
+	if path.IsLeaf() {
+		secret, ok := val.(string)
+		if !ok {
+			return "", false, fmt.Errorf("expected string but got %T", val)
+		}
+		return secret, true, nil
+	}
+	sub, ok := val.(map[string]any)
+	if !ok {
+		return "", false, fmt.Errorf("expected nested object but got %T", val)
+	}
+	return extractField(sub, path.Tail())
+}
+
+func getFieldValue(settings map[string]any, path IntegrationFieldPath) (any, bool) {
+	val, ok := settings[path.Head()]
+	if !ok {
+		return nil, false
+	}
+	if path.IsLeaf() {
+		return val, true
+	}
+	sub, ok := val.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return getFieldValue(sub, path.Tail())
+}
+
+func setField(settings map[string]any, path IntegrationFieldPath, valueFn func(current any) any, skipIfNotExist bool) error {
+	if path.IsLeaf() {
+		current, ok := settings[path.Head()]
+		if skipIfNotExist && !ok {
+			return nil
+		}
+		settings[path.Head()] = valueFn(current)
+		return nil
+	}
+	val, ok := settings[path.Head()]
+	if !ok {
+		if skipIfNotExist {
+			return nil
+		}
+		val = map[string]any{}
+		settings[path.Head()] = val
+	}
+	sub, ok := val.(map[string]any)
+	if !ok {
+		return fmt.Errorf("expected nested object but got %T", val)
+	}
+	return setField(sub, path.Tail(), valueFn, skipIfNotExist)
 }
 
 // Decrypt decrypts all fields in SecureSettings and moves them to Settings.
@@ -252,30 +377,33 @@ func (integration *Integration) Decrypt(decryptFn DecryptFn) error {
 			errs = append(errs, fmt.Errorf("failed to decrypt secure setting '%s': %w", key, err))
 		}
 		delete(integration.SecureSettings, key)
-		integration.Settings[key] = decrypted
-	}
 
+		path := IntegrationFieldPath(strings.Split(key, "."))
+		err = setField(integration.Settings, path, func(current any) any {
+			return decrypted
+		}, false)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to set field '%s': %w", key, err))
+		}
+	}
 	return errors.Join(errs...)
 }
 
 // Redact redacts all fields in SecureSettings and moves them to Settings.
 // The original values are removed from SecureSettings.
 func (integration *Integration) Redact(redactFn RedactFn) {
-	for key, secureVal := range integration.SecureSettings { // TODO: Should we trust that the receiver is stored correctly or use known secure settings?
-		integration.Settings[key] = redactFn(secureVal)
-		delete(integration.SecureSettings, key)
+	for _, path := range integration.Config.GetSecretFields() {
+		_ = setField(integration.Settings, path, func(current any) any {
+			s, _ := current.(string)
+			return redactFn(s)
+		}, true)
 	}
 
-	// We don't trust that the receiver is stored correctly, so we redact secure fields in the settings as well.
-	for key, val := range integration.Settings {
-		if val != "" && integration.Config.IsSecureField(key) {
-			s, isString := val.(string)
-			if !isString {
-				continue
-			}
-			integration.Settings[key] = redactFn(s)
-			delete(integration.SecureSettings, key)
-		}
+	for key, secureVal := range integration.SecureSettings { // TODO: Should we trust that the receiver is stored correctly or use known secure settings?
+		_ = setField(integration.Settings, strings.Split(key, "."), func(any) any {
+			return redactFn(secureVal)
+		}, false)
+		delete(integration.SecureSettings, key)
 	}
 }
 
@@ -304,11 +432,17 @@ func (integration *Integration) SecureFields() map[string]bool {
 			secureFields[key] = true
 		}
 	}
-
 	// We mark secure fields in the settings as well. This is to ensure legacy behaviour for redacted secure settings.
-	for key, val := range integration.Settings {
-		if val != "" && integration.Config.IsSecureField(key) {
-			secureFields[key] = true
+	for _, path := range integration.Config.GetSecretFields() {
+		if secureFields[path.String()] {
+			continue
+		}
+		value, ok := getFieldValue(integration.Settings, path)
+		if !ok || value == nil {
+			continue
+		}
+		if v, _ := value.(string); v != "" {
+			secureFields[path.String()] = true
 		}
 	}
 
