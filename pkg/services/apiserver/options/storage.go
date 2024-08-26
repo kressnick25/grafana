@@ -8,7 +8,7 @@ import (
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/options"
 
-	grafanarest "github.com/grafana/grafana/pkg/apiserver/rest"
+	"github.com/grafana/grafana/pkg/setting"
 )
 
 type StorageType string
@@ -22,10 +22,10 @@ const (
 )
 
 type StorageOptions struct {
-	StorageType            StorageType
-	DataPath               string
-	Address                string
-	DualWriterDesiredModes map[string]grafanarest.DualWriterMode
+	StorageType          StorageType
+	DataPath             string
+	Address              string
+	UnifiedStorageConfig map[string]setting.UnifiedStorageConfig
 }
 
 func NewStorageOptions() *StorageOptions {
